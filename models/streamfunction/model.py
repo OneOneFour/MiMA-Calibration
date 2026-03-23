@@ -76,12 +76,12 @@ def get_ModelParameterPriorDict(
     # B = (prior_range[1] - tmm[0]) / (tmm[1] - tmm[0])
 
     prior_dict: ModelParameterPriorDict = {
-        "thetas": {
-            "theta_0": ParameterPrior(
+        "thetas": { # Has to be called thetas
+            "theta_0": ParameterPrior( # Has to be consistnet
                 dist.Beta(
                     concentration1=4.0, concentration0=2.0
                 ),  # often around 0.7, probably >0.5, beta dist good, p(0)=0, p(1)!=0
-                name="theta_0",
+                name="theta_0", # Strongly recommend including this name!
             ),
             # "theta_1": ParameterPrior(dist.Uniform(), name="theta_1"),
             "theta_1": ParameterPrior(
