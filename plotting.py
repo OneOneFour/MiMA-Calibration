@@ -77,7 +77,7 @@ def plot_sim_sample(
         sort_idx = np.argsort(x_rows)
 
         label_vals = [f"{ti:.2f}" for ti in t]
-        label = f"Sim {i + 1}: $t$=({', '.join(label_vals)})"
+        label = f"Sim {i + 1}: $RH$=({', '.join(label_vals)})"
 
         ax.plot(
             x_rows[sort_idx],

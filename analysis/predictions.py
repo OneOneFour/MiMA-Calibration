@@ -246,7 +246,8 @@ def run(
         delta_pred = posterior_GP.predict_delta(X_pred, train_data=train_data)
 
         # Standard 1D plotting
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, (ax,ax2) = plt.subplots(1,2,figsize=(13, 6))
+        
         dashed = (0, (5, 5))
 
         theta_str = "".join([f"{val:.2f}, " for val in theta.flatten()])[:-2]
@@ -288,9 +289,8 @@ def run(
             r"$f_\zeta(x)$",
             alpha=0.22,
         )
-        axt = ax.twinx()
         plot_GP(
-            axt,
+            ax2,
             X_pred[:, 0],
             delta_pred,
             0,
@@ -303,14 +303,14 @@ def run(
         # See link below for combining legends from two axes
         # https://stackoverflow.com/a/10129461
         lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = axt.get_legend_handles_labels()
-        ax.legend(lines + lines2, labels + labels2, loc=0)
+        # lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines , labels , loc=0)
 
         if len(experiment_config.data.obs_coord_names) > 0:
             ax.set_xlabel(experiment_config.data.obs_coord_names[0])
         else:
             ax.set_xlabel("x")
-        axt.set_ylabel("Discrepancy")
+        ax2.set_ylabel("Discrepancy")
         ax.set_ylabel(experiment_config.data.obs_variable_name)
 
         title = f"Predictions for {file_name}"

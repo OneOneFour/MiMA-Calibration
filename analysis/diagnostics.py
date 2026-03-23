@@ -85,4 +85,22 @@ def run(model_dir: str, output_dir: str = None):
     plt.savefig(os.path.join(diag_dir, "pair_plot.png"))
     plt.close()
 
+    try:
+        az.plot_pair(
+        idata, 
+        var_names=["theta_0", "theta_1"], 
+        kind="kde",         # Optional: 'scatter', 'kde', or 'hexbin'
+        marginals=True      # Optional: adds 1D marginal distributions to the axes
+        )
+    except Exception:
+        az.plot_pair(
+            idata, 
+            var_names=["theta_0", "theta_1"], 
+            kind="scatter",         # Optional: 'scatter', 'kde', or 'hexbin'
+            marginals=True      # Optional: adds 1D marginal distributions to the axes
+        )
+    plt.tight_layout()
+    plt.savefig(os.path.join(diag_dir, "pair_theta0_theta1.png"))
+    plt.close()
+
     print(f"Plots saved to {diag_dir}")
