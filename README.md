@@ -103,6 +103,37 @@ python main.py analyze <experiment_run_dir>
 python main.py analyze experiments/T21/20251212_120000_W100_N100
 ```
 
+## Standalone UQ From Input Samples
+
+For uncertainty quantification from externally generated model samples `G` (independent of scenario/control labels), use the standalone script:
+
+```bash
+python analysis/uq_from_samples.py \
+	--model_dir <experiment_run_dir>/model \
+	--manifest_path <path/to/sample_manifest.csv> \
+	--g_samples_path <path/to/g_samples.nc> \
+	--chain_path <experiment_run_dir>/<chain_file>.nc \
+	--output_dir <path/to/output_dir> \
+	--g_var precip \
+	--composition_mode deterministic
+```
+
+The manifest CSV must include at least:
+
+- `run_name`
+- `sample_index`
+- `chain`
+- `draw`
+
+Optional manifest columns (for example `co2ppmv`, `rhbm`, `taubm`) are preserved in outputs for diagnostics.
+
+Outputs written to `output_dir`:
+
+- `uq_samples.nc`: Per-sample fields (G only, G + discrepancy, G + discrepancy + noise) and component diagnostics.
+- `uq_summary.nc`: Spatial summaries (mean/std/p05/p50/p95) and optional truth-based bias fields.
+- `uq_summary.json`: Scalar diagnostics.
+- `distribution_comparison.png` and (for 1D space) `profile_comparison.png`.
+
 ## Directory Structure
 
 *   `main.py`: Main CLI entry point.
