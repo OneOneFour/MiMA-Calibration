@@ -25,6 +25,12 @@ def _parse_space_dims(space_dims_arg: str | None) -> List[str] | None:
     return dims if dims else None
 
 
+def _parse_dim_list(dim_list_arg: str | None) -> List[str]:
+    if not dim_list_arg:
+        return []
+    return [d.strip() for d in dim_list_arg.split(",") if d.strip()]
+
+
 def _load_manifest(manifest_path: str) -> pd.DataFrame:
     required_cols = ["run_name", "sample_index", "chain", "draw"]
     manifest = pd.read_csv(manifest_path)
@@ -155,6 +161,128 @@ def _prepare_space_grid(
     x_points = np.column_stack([m.reshape(-1) for m in mesh])
 
     return resolved_space_dims, coords, x_points
+
+
+def _validate_matching_coords(
+    ref: np.ndarray,
+    other: np.ndarray,
+    dim_name: str,
+) -> None:
+    if ref.shape != other.shape:
+        raise ValueError(
+            f"Coordinate shape mismatch for dim '{dim_name}': {ref.shape} vs {other.shape}."
+        )
+
+    if np.issubdtype(ref.dtype, np.number) and np.issubdtype(other.dtype, np.number):
+        if not np.allclose(ref, other, equal_nan=True):
+            raise ValueError(f"Coordinate values differ across runs for dim '{dim_name}'.")
+    else:
+        if not np.array_equal(ref.astype(str), other.astype(str)):
+            raise ValueError(f"Coordinate labels differ across runs for dim '{dim_name}'.")
+
+
+def _load_g_from_run_directory(
+    run_root: str,
+    manifest: pd.DataFrame,
+    g_var: str,
+    run_file: str,
+    reduce_dims: List[str],
+) -> xr.DataArray:
+    values_list: List[np.ndarray] = []
+    template_dims: List[str] | None = None
+    template_coords: Dict[str, np.ndarray] = {}
+    template_shape: Tuple[int, ...] | None = None
+
+    for row in manifest.itertuples(index=False):
+        run_name = str(getattr(row, "run_name"))
+        run_file_path = os.path.join(run_root, run_name, run_file)
+        if not os.path.exists(run_file_path):
+            raise ValueError(f"Run file not found for {run_name}: {run_file_path}")
+
+        ds = xr.open_dataset(run_file_path, decode_times=False)
+        if g_var not in ds:
+            raise ValueError(
+                f"Variable '{g_var}' not found in {run_file_path}. Available vars: {list(ds.data_vars)}"
+            )
+
+        da = ds[g_var]
+        for d in reduce_dims:
+            if d in da.dims:
+                da = da.mean(dim=d)
+
+        da = da.squeeze(drop=True)
+
+        run_dims = [str(d) for d in da.dims]
+        run_values = np.asarray(da.values)
+
+        if template_dims is None:
+            template_dims = run_dims
+            template_shape = run_values.shape
+            for d in template_dims:
+                if d in da.coords:
+                    template_coords[d] = np.asarray(da.coords[d].values)
+                else:
+                    template_coords[d] = np.arange(da.sizes[d])
+        else:
+            if run_dims != template_dims:
+                raise ValueError(
+                    f"Dimension mismatch in {run_name}: got {run_dims}, expected {template_dims}."
+                )
+            if run_values.shape != template_shape:
+                raise ValueError(
+                    f"Shape mismatch in {run_name}: got {run_values.shape}, expected {template_shape}."
+                )
+            for d in template_dims:
+                if d in da.coords:
+                    run_coord = np.asarray(da.coords[d].values)
+                else:
+                    run_coord = np.arange(da.sizes[d])
+                _validate_matching_coords(template_coords[d], run_coord, d)
+
+        values_list.append(run_values)
+
+    if template_dims is None:
+        raise ValueError("No runs were loaded from run directory.")
+
+    stacked = np.stack(values_list, axis=0)
+    coords: Dict[str, Any] = {"sample_index": manifest["sample_index"].to_numpy()}
+    for d in template_dims:
+        coords[d] = template_coords[d]
+
+    return xr.DataArray(
+        stacked,
+        dims=("sample_index", *template_dims),
+        coords=coords,
+        name=g_var,
+    )
+
+
+def _load_g_dataarray(
+    g_samples_path: str,
+    manifest: pd.DataFrame,
+    g_var: str,
+    sample_dim: str | None,
+    run_file: str,
+    reduce_dims: List[str],
+) -> Tuple[xr.DataArray, str]:
+    if os.path.isdir(g_samples_path):
+        g_da = _load_g_from_run_directory(
+            run_root=g_samples_path,
+            manifest=manifest,
+            g_var=g_var,
+            run_file=run_file,
+            reduce_dims=reduce_dims,
+        )
+        return g_da, "sample_index"
+
+    g_ds = xr.open_dataset(g_samples_path, decode_times=False)
+    if g_var not in g_ds:
+        raise ValueError(f"Variable '{g_var}' not found in {g_samples_path}.")
+
+    g_da = g_ds[g_var]
+    inferred_sample_dim = _infer_sample_dim(g_da, manifest, sample_dim)
+    g_da = _align_g_samples_with_manifest(g_da, inferred_sample_dim, manifest)
+    return g_da, inferred_sample_dim
 
 
 def _build_chain_draw_index_map(
@@ -334,6 +462,8 @@ def run(
     g_var: str = "precip",
     sample_dim: str | None = None,
     space_dims: List[str] | None = None,
+    run_file: str = "atmos_davg.nc",
+    reduce_dims: List[str] | None = None,
     truth_path: str | None = None,
     truth_var: str | None = None,
     composition_mode: str = "deterministic",
@@ -360,14 +490,16 @@ def run(
     # Load and validate manifest
     manifest = _load_manifest(manifest_path)
 
-    # Load G samples and align with manifest
-    g_ds = xr.open_dataset(g_samples_path, decode_times=False)
-    if g_var not in g_ds:
-        raise ValueError(f"Variable '{g_var}' not found in {g_samples_path}.")
-
-    g_da = g_ds[g_var]
-    inferred_sample_dim = _infer_sample_dim(g_da, manifest, sample_dim)
-    g_da = _align_g_samples_with_manifest(g_da, inferred_sample_dim, manifest)
+    # Load G samples either from a single NetCDF file or a run-root directory.
+    # Directory mode expects subfolders from manifest run_name values containing run_file.
+    g_da, inferred_sample_dim = _load_g_dataarray(
+        g_samples_path=g_samples_path,
+        manifest=manifest,
+        g_var=g_var,
+        sample_dim=sample_dim,
+        run_file=run_file,
+        reduce_dims=reduce_dims or [],
+    )
 
     if len(manifest) != g_da.sizes[inferred_sample_dim]:
         raise ValueError("Manifest row count does not match aligned G sample count.")
@@ -660,6 +792,18 @@ def main() -> None:
     parser.add_argument("--g_var", type=str, default="precip")
     parser.add_argument("--sample_dim", type=str, default=None)
     parser.add_argument(
+        "--run_file",
+        type=str,
+        default="atmos_davg.nc",
+        help="File name inside each run_<id> folder when g_samples_path is a run-root directory.",
+    )
+    parser.add_argument(
+        "--reduce_dims",
+        type=str,
+        default=None,
+        help="Comma-separated dimensions to average over before stacking run files, e.g. 'time,lon'.",
+    )
+    parser.add_argument(
         "--space_dims",
         type=str,
         default=None,
@@ -688,6 +832,8 @@ def main() -> None:
         g_var=args.g_var,
         sample_dim=args.sample_dim,
         space_dims=_parse_space_dims(args.space_dims),
+        run_file=args.run_file,
+        reduce_dims=_parse_dim_list(args.reduce_dims),
         truth_path=args.truth_path,
         truth_var=args.truth_var,
         composition_mode=args.composition_mode,
