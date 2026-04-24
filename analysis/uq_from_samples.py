@@ -31,6 +31,131 @@ def _parse_dim_list(dim_list_arg: str | None) -> List[str]:
     return [d.strip() for d in dim_list_arg.split(",") if d.strip()]
 
 
+def _resolve_path(path: str, experiment_path: str | None) -> str:
+    if os.path.isabs(path) or experiment_path is None:
+        return path
+    return os.path.join(experiment_path, path)
+
+
+def _auto_detect_chain_file(experiment_path: str) -> str:
+    candidates = sorted(
+        [
+            os.path.join(experiment_path, f)
+            for f in os.listdir(experiment_path)
+            if f.endswith(".nc") and os.path.isfile(os.path.join(experiment_path, f))
+        ]
+    )
+    if not candidates:
+        raise ValueError(
+            f"No top-level .nc file found in experiment_path: {experiment_path}. "
+            "Provide --chain_path explicitly."
+        )
+
+    preferred = [p for p in candidates if "Nsim" in os.path.basename(p)]
+    if len(preferred) == 1:
+        return preferred[0]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    raise ValueError(
+        "Could not uniquely determine chain_path from experiment_path. "
+        f"Candidates: {[os.path.basename(p) for p in candidates]}. "
+        "Provide --chain_path explicitly."
+    )
+
+
+def _resolve_inputs(
+    model_dir: str | None,
+    experiment_path: str | None,
+    manifest_path: str | None,
+    g_samples_path: str | None,
+    chain_path: str | None,
+    output_dir: str | None,
+) -> Tuple[str, str, str, str, str]:
+    exp = os.path.abspath(experiment_path) if experiment_path else None
+
+    if model_dir is None:
+        if exp and os.path.isdir(os.path.join(exp, "model")):
+            model_dir = os.path.join(exp, "model")
+        else:
+            raise ValueError("model_dir is required (or experiment_path/model must exist).")
+    model_dir = os.path.abspath(_resolve_path(model_dir, exp))
+
+    if manifest_path is None:
+        if exp is None:
+            raise ValueError("manifest_path is required unless experiment_path is provided.")
+        manifest_path = os.path.join(exp, "samples.csv")
+    manifest_path = os.path.abspath(_resolve_path(manifest_path, exp))
+
+    if g_samples_path is None:
+        if exp is None:
+            raise ValueError("g_samples_path is required unless experiment_path is provided.")
+        g_samples_path = exp
+    g_samples_path = os.path.abspath(_resolve_path(g_samples_path, exp))
+
+    if chain_path is None:
+        if exp is None:
+            raise ValueError("chain_path is required unless experiment_path is provided.")
+        chain_path = _auto_detect_chain_file(exp)
+    chain_path = os.path.abspath(_resolve_path(chain_path, exp))
+
+    if output_dir is None:
+        if exp is None:
+            raise ValueError("output_dir is required unless experiment_path is provided.")
+        output_dir = os.path.join(exp, "uq_outputs")
+    output_dir = os.path.abspath(_resolve_path(output_dir, exp))
+
+    return model_dir, manifest_path, g_samples_path, chain_path, output_dir
+
+
+def _choose_g_var(ds: xr.Dataset, requested_g_var: str | None) -> str:
+    if requested_g_var is not None:
+        if requested_g_var not in ds.data_vars:
+            raise ValueError(
+                f"Variable '{requested_g_var}' not found. Available vars: {list(ds.data_vars)}"
+            )
+        return requested_g_var
+
+    preferred = ["precip_mean", "precip", "precip_quantile"]
+    for name in preferred:
+        if name in ds.data_vars:
+            return name
+
+    if len(ds.data_vars) == 1:
+        return str(next(iter(ds.data_vars)))
+
+    raise ValueError(
+        "Could not auto-detect g variable. Provide --g_var explicitly. "
+        f"Available vars: {list(ds.data_vars)}"
+    )
+
+
+def _detect_run_file(run_root: str, first_run_name: str, run_file: str | None) -> str:
+    run_dir = os.path.join(run_root, first_run_name)
+    if not os.path.isdir(run_dir):
+        raise ValueError(f"Run directory not found: {run_dir}")
+
+    if run_file:
+        candidate = os.path.join(run_dir, run_file)
+        if not os.path.exists(candidate):
+            raise ValueError(f"--run_file '{run_file}' not found in {run_dir}")
+        return run_file
+
+    defaults = ["moist.nc", "atmos_davg.nc", "atmos_4xdaily.nc"]
+    for f in defaults:
+        if os.path.exists(os.path.join(run_dir, f)):
+            return f
+
+    nc_files = sorted([f for f in os.listdir(run_dir) if f.endswith(".nc")])
+    if len(nc_files) == 1:
+        return nc_files[0]
+
+    raise ValueError(
+        f"Could not auto-detect run file in {run_dir}. "
+        f"NetCDF candidates: {nc_files}. Provide --run_file explicitly."
+    )
+
+
 def _load_manifest(manifest_path: str) -> pd.DataFrame:
     required_cols = ["run_name", "sample_index", "chain", "draw"]
     manifest = pd.read_csv(manifest_path)
@@ -184,28 +309,33 @@ def _validate_matching_coords(
 def _load_g_from_run_directory(
     run_root: str,
     manifest: pd.DataFrame,
-    g_var: str,
-    run_file: str,
+    g_var: str | None,
+    run_file: str | None,
     reduce_dims: List[str],
 ) -> xr.DataArray:
     values_list: List[np.ndarray] = []
     template_dims: List[str] | None = None
     template_coords: Dict[str, np.ndarray] = {}
     template_shape: Tuple[int, ...] | None = None
+    selected_run_file = _detect_run_file(run_root, str(manifest.iloc[0]["run_name"]), run_file)
+    selected_g_var: str | None = None
 
     for row in manifest.itertuples(index=False):
         run_name = str(getattr(row, "run_name"))
-        run_file_path = os.path.join(run_root, run_name, run_file)
+        run_file_path = os.path.join(run_root, run_name, selected_run_file)
         if not os.path.exists(run_file_path):
             raise ValueError(f"Run file not found for {run_name}: {run_file_path}")
 
         ds = xr.open_dataset(run_file_path, decode_times=False)
-        if g_var not in ds:
+        if selected_g_var is None:
+            selected_g_var = _choose_g_var(ds, g_var)
+
+        if selected_g_var not in ds:
             raise ValueError(
-                f"Variable '{g_var}' not found in {run_file_path}. Available vars: {list(ds.data_vars)}"
+                f"Variable '{selected_g_var}' not found in {run_file_path}. Available vars: {list(ds.data_vars)}"
             )
 
-        da = ds[g_var]
+        da = ds[selected_g_var]
         for d in reduce_dims:
             if d in da.dims:
                 da = da.mean(dim=d)
@@ -253,16 +383,16 @@ def _load_g_from_run_directory(
         stacked,
         dims=("sample_index", *template_dims),
         coords=coords,
-        name=g_var,
+        name=selected_g_var,
     )
 
 
 def _load_g_dataarray(
     g_samples_path: str,
     manifest: pd.DataFrame,
-    g_var: str,
+    g_var: str | None,
     sample_dim: str | None,
-    run_file: str,
+    run_file: str | None,
     reduce_dims: List[str],
 ) -> Tuple[xr.DataArray, str]:
     if os.path.isdir(g_samples_path):
@@ -276,10 +406,8 @@ def _load_g_dataarray(
         return g_da, "sample_index"
 
     g_ds = xr.open_dataset(g_samples_path, decode_times=False)
-    if g_var not in g_ds:
-        raise ValueError(f"Variable '{g_var}' not found in {g_samples_path}.")
-
-    g_da = g_ds[g_var]
+    selected_g_var = _choose_g_var(g_ds, g_var)
+    g_da = g_ds[selected_g_var]
     inferred_sample_dim = _infer_sample_dim(g_da, manifest, sample_dim)
     g_da = _align_g_samples_with_manifest(g_da, inferred_sample_dim, manifest)
     return g_da, inferred_sample_dim
@@ -454,15 +582,16 @@ def _plot_profile_if_1d(
 
 
 def run(
-    model_dir: str,
-    manifest_path: str,
-    g_samples_path: str,
-    chain_path: str,
-    output_dir: str,
-    g_var: str = "precip",
+    model_dir: str | None = None,
+    experiment_path: str | None = None,
+    manifest_path: str | None = None,
+    g_samples_path: str | None = None,
+    chain_path: str | None = None,
+    output_dir: str | None = None,
+    g_var: str | None = None,
     sample_dim: str | None = None,
     space_dims: List[str] | None = None,
-    run_file: str = "atmos_davg.nc",
+    run_file: str | None = None,
     reduce_dims: List[str] | None = None,
     truth_path: str | None = None,
     truth_var: str | None = None,
@@ -471,6 +600,21 @@ def run(
 ) -> None:
     if composition_mode not in {"deterministic", "stochastic"}:
         raise ValueError("composition_mode must be either 'deterministic' or 'stochastic'.")
+
+    (
+        model_dir,
+        manifest_path,
+        g_samples_path,
+        chain_path,
+        output_dir,
+    ) = _resolve_inputs(
+        model_dir=model_dir,
+        experiment_path=experiment_path,
+        manifest_path=manifest_path,
+        g_samples_path=g_samples_path,
+        chain_path=chain_path,
+        output_dir=output_dir,
+    )
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -783,19 +927,56 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Input-agnostic UQ from provided G samples + posterior discrepancy/noise."
     )
-    parser.add_argument("--model_dir", type=str, required=True)
-    parser.add_argument("--manifest_path", type=str, required=True)
-    parser.add_argument("--g_samples_path", type=str, required=True)
-    parser.add_argument("--chain_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--experiment_path",
+        type=str,
+        default=None,
+        help="Standardized experiment directory containing samples.csv and run_<id> folders.",
+    )
 
-    parser.add_argument("--g_var", type=str, default="precip")
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default=None,
+        help="Path to calibration model dir. If omitted, uses <experiment_path>/model when available.",
+    )
+    parser.add_argument(
+        "--manifest_path",
+        type=str,
+        default=None,
+        help="Manifest CSV path. Defaults to <experiment_path>/samples.csv.",
+    )
+    parser.add_argument(
+        "--g_samples_path",
+        type=str,
+        default=None,
+        help="Either a NetCDF file or a run-root directory. Defaults to <experiment_path>.",
+    )
+    parser.add_argument(
+        "--chain_path",
+        type=str,
+        default=None,
+        help="Posterior chain NetCDF path. Defaults to auto-detected top-level .nc in experiment_path.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory. Defaults to <experiment_path>/uq_outputs.",
+    )
+
+    parser.add_argument(
+        "--g_var",
+        type=str,
+        default=None,
+        help="Variable to extract. Defaults to auto-detected precip_mean/precip/precip_quantile.",
+    )
     parser.add_argument("--sample_dim", type=str, default=None)
     parser.add_argument(
         "--run_file",
         type=str,
-        default="atmos_davg.nc",
-        help="File name inside each run_<id> folder when g_samples_path is a run-root directory.",
+        default=None,
+        help="File name inside each run_<id> folder. Defaults to auto-detected moist.nc/atmos_davg.nc.",
     )
     parser.add_argument(
         "--reduce_dims",
@@ -824,6 +1005,7 @@ def main() -> None:
     args = parser.parse_args()
 
     run(
+        experiment_path=args.experiment_path,
         model_dir=args.model_dir,
         manifest_path=args.manifest_path,
         g_samples_path=args.g_samples_path,
