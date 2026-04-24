@@ -928,17 +928,15 @@ def main() -> None:
         description="Input-agnostic UQ from provided G samples + posterior discrepancy/noise."
     )
     parser.add_argument(
-        "--experiment_path",
+        "experiment_path",
         type=str,
-        default=None,
         help="Standardized experiment directory containing samples.csv and run_<id> folders.",
     )
 
     parser.add_argument(
-        "--model_dir",
+        "model_dir",
         type=str,
-        default=None,
-        help="Path to calibration model dir. If omitted, uses <experiment_path>/model when available.",
+        help="Path to calibration model dir.",
     )
     parser.add_argument(
         "--manifest_path",
